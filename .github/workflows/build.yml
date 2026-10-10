@@ -1,0 +1,146 @@
+name: Build API image and Android app
+
+# Builds the backend API (+ migration job) containers and an Android APK without EAS.
+# - Pull requests: build both, publish nothing (APK still uploaded as an artifact).
+# - Push to main / manual run: push the API image to GHCR, upload the APK artifact.
+# - Tag v*: also attach the APK to a GitHub release.
+#
+# Optional repository configuration (Settings → Secrets and variables → Actions):
+#   vars.EXPO_PUBLIC_API_URL                HTTPS API URL baked into the app
+#   vars.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY  Clerk publishable key (pk_test_/pk_live_)
+#     Both set   -> "preview" app (OpenSociety, com.opensociety.app)
+#     Either unset -> development app (OpenSociety Dev, com.opensociety.app.dev)
+#   secrets.ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS,
+#   ANDROID_KEY_PASSWORD
+#     Set -> APK is re-signed with your release key. Unset -> debug-signed APK
+#     (installable by sideloading, but not upgradable to a differently signed build).
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-image:
+    name: ${{ matrix.target }} Docker image
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # api: the backend; migrate: one-shot DB migration job (deploy/selfhost).
+        target: [api, migrate]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-${{ matrix.target }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      EXPO_PUBLIC_API_URL: ${{ vars.EXPO_PUBLIC_API_URL }}
+      EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ vars.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY }}
+      APP_ENV: ${{ vars.EXPO_PUBLIC_API_URL != '' && vars.EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY != '' && 'preview' || '' }}
+      EXPO_NO_TELEMETRY: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.17.0
+          cache: pnpm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @opensociety/shared build
+
+      - name: Generate native Android project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform android --no-install --clean
+
+      - name: Build release APK
+        working-directory: apps/mobile/android
+        run: ./gradlew assembleRelease --no-daemon -PreactNativeArchitectures=arm64-v8a,armeabi-v7a
+
+      - name: Sign and name APK
+        working-directory: apps/mobile
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          variant="${APP_ENV:-development}"
+          out="$RUNNER_TEMP/opensociety-${variant}-${GITHUB_SHA::7}.apk"
+          cp android/app/build/outputs/apk/release/app-release.apk "$out"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
+            "$apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-pass env:KEYSTORE_PASSWORD \
+              --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD "$out"
+            rm "$RUNNER_TEMP/release.jks"
+            echo "Signed with release keystore" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No ANDROID_KEYSTORE_BASE64 secret: APK is debug-signed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "APK_PATH=$out" >> "$GITHUB_ENV"
+          echo "Variant: **${variant}**" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Attach APK to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.APK_PATH }}

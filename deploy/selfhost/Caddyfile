@@ -1,0 +1,13 @@
+# Used by the optional `caddy` service (docker compose --profile caddy up -d).
+# Domains come from WEB_DOMAIN / API_DOMAIN in .env.
+{$WEB_DOMAIN} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy web:3000
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy api:8787
+}

@@ -1,2 +1,2 @@
-export { createDb, getDb, type Database } from './client'
+export { createDb, getDb, closeDbPools, type Database } from './client'
 export * from './schema'
