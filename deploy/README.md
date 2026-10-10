@@ -2,6 +2,8 @@
 
 The Droplet is not provisioned, confirmed on 2026-10-02. No public deployment, production migration, DNS change, or image publication has been performed. Shared account and billing facts remain in the shared hosting memory.
 
+To run everything on your own server with your own PostgreSQL, see [selfhost/README.md](selfhost/README.md).
+
 Run one API and one web container per society, with Neon for the database and R2 for object storage. A shared host-level Caddy process terminates HTTPS and forwards to loopback-only ports. Each container has a 384 MiB memory cap. Measure these initial limits alongside the other shared applications before claiming capacity. Build images in GitHub Actions. Local development uses pnpm workspaces and Turborepo to keep Docker images and cache off the Mac.
 
 ## Build

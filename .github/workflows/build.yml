@@ -1,6 +1,6 @@
 name: Build API image and Android app
 
-# Builds the backend API container and an Android APK without EAS.
+# Builds the backend API (+ migration job) containers and an Android APK without EAS.
 # - Pull requests: build both, publish nothing (APK still uploaded as an artifact).
 # - Push to main / manual run: push the API image to GHCR, upload the APK artifact.
 # - Tag v*: also attach the APK to a GitHub release.
@@ -32,8 +32,12 @@ concurrency:
 
 jobs:
   api-image:
-    name: API Docker image
+    name: ${{ matrix.target }} Docker image
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # api: the backend; migrate: one-shot DB migration job (deploy/selfhost).
+        target: [api, migrate]
     permissions:
       contents: read
       packages: write
@@ -50,7 +54,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}-api
+          images: ghcr.io/${{ github.repository }}-${{ matrix.target }}
           tags: |
             type=sha,format=long
             type=ref,event=branch
@@ -59,13 +63,13 @@ jobs:
       - uses: docker/build-push-action@v6
         with:
           context: .
-          target: api
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=api
-          cache-to: type=gha,mode=max,scope=api
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
 
   android:
     name: Android APK
@@ -87,7 +91,7 @@ jobs:
         with:
           node-version: 22.17.0
           cache: pnpm
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17

@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server'
+import { closeDbPools } from '@opensociety/db'
 import { app } from '../index'
 import type { Bindings } from '../types'
 import { readNodeConfig } from './config'
@@ -23,6 +24,7 @@ async function shutdown() {
   closing = true
   const timeout = setTimeout(() => process.exit(1), 25_000)
   await Promise.all([stopJobs(), new Promise<void>((resolve) => server.close(() => resolve()))])
+  await closeDbPools()
   clearTimeout(timeout)
   process.exit(0)
 }

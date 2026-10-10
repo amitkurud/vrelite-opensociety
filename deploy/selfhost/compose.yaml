@@ -1,0 +1,145 @@
+# Self-hosted OpenSociety: PostgreSQL + migrations + API + web (+ optional Caddy).
+# See deploy/selfhost/README.md. Run from this directory:
+#   docker compose up -d --build                  # app on loopback ports
+#   docker compose --profile caddy up -d --build  # plus HTTPS on :80/:443
+name: opensociety
+
+x-hardening: &hardening
+  restart: unless-stopped
+  init: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: '3' }
+
+x-database-url: &database-url postgresql://${POSTGRES_USER:-opensociety}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-opensociety}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-opensociety}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-opensociety}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Not published by default; uncomment to reach it from the host (psql, backups).
+    # ports:
+    #   - 127.0.0.1:5432:5432
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    shm_size: 128m
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: '3' }
+
+  # Applies checked-in migrations, then exits. The API waits for it to succeed.
+  migrate:
+    image: ${MIGRATE_IMAGE:-opensociety-migrate:local}
+    build: { context: ../.., target: migrate }
+    environment:
+      DATABASE_URL: *database-url
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+
+  api:
+    <<: *hardening
+    image: ${API_IMAGE:-opensociety-api:local}
+    build: { context: ../.., target: api }
+    env_file: api.env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8787
+      NODE_OPTIONS: --max-old-space-size=256
+      DATABASE_URL: *database-url
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8787}:8787
+    read_only: true
+    tmpfs: [/tmp:size=32m]
+    mem_limit: 384m
+    stop_grace_period: 30s
+
+  web:
+    <<: *hardening
+    image: ${WEB_IMAGE:-opensociety-web:local}
+    build:
+      context: ../..
+      target: web
+      args:
+        # production requires a pk_live_ key; use staging with pk_test_ keys.
+        DEPLOY_ENV: ${WEB_DEPLOY_ENV:-production}
+        VITE_API_URL: https://${API_DOMAIN:?Set API_DOMAIN in .env}
+        VITE_CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:?Set CLERK_PUBLISHABLE_KEY in .env}
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      NODE_OPTIONS: --max-old-space-size=256
+    ports:
+      - ${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-3000}:3000
+    read_only: true
+    tmpfs: [/tmp:size=32m]
+    mem_limit: 384m
+    stop_grace_period: 30s
+
+  # Nightly pg_dump into ./backups, keeping BACKUP_KEEP_DAYS days. Copy these off the host.
+  backup:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-opensociety}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:-opensociety}
+      KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      postgres: { condition: service_healthy }
+    entrypoint:
+      - sh
+      - -c
+      - |
+        while true; do
+          f=/backups/opensociety-$$(date +%Y%m%d-%H%M).dump
+          pg_dump -Fc -f "$$f.tmp" && mv "$$f.tmp" "$$f" && echo "backup: wrote $$f" || echo "backup: FAILED"
+          find /backups -name 'opensociety-*.dump' -mtime +$$KEEP_DAYS -delete
+          sleep 86400
+        done
+    logging:
+      driver: json-file
+      options: { max-size: 1m, max-file: '2' }
+
+  # Optional HTTPS front door (Let's Encrypt). Needs public DNS for both domains
+  # pointing here and ports 80/443 reachable from the internet.
+  caddy:
+    image: caddy:2-alpine
+    profiles: [caddy]
+    restart: unless-stopped
+    environment:
+      WEB_DOMAIN: ${WEB_DOMAIN:-}
+      API_DOMAIN: ${API_DOMAIN:-}
+    ports:
+      - 80:80
+      - 443:443
+      - 443:443/udp
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api, web]
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

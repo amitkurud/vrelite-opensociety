@@ -11,6 +11,12 @@ COPY apps/web ./apps/web
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm --filter @opensociety/api... --filter @opensociety/web... install --frozen-lockfile
 RUN pnpm --filter @opensociety/shared build && pnpm --filter @opensociety/db build
 
+# One-shot job that applies the checked-in Drizzle migrations to DATABASE_URL.
+FROM build AS migrate
+WORKDIR /repo/packages/db
+USER node
+CMD ["./node_modules/.bin/drizzle-kit", "migrate"]
+
 FROM build AS api-build
 RUN pnpm --filter @opensociety/api build && pnpm --filter @opensociety/api build:node
 
